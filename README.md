@@ -4,6 +4,12 @@
 
 The city is real: about 256k building footprints, 25k workplaces, shops, schools and other places, and a 26k-junction road network, all taken from OpenStreetMap. The people are synthetic. Each record is generated from distributions loosely calibrated to the 2021 Census for Birmingham.
 
+![All one million residents at 08:30, coloured by what they're doing](docs/map.png)
+
+| Resident record and road route | Analytics dashboard |
+|---|---|
+| ![Resident record](docs/person.png) | ![Analytics](docs/analytics.png) |
+
 | | |
 |---|---|
 | **Database** | PostgreSQL 17 + PostGIS 3.5 + pgRouting 3.8 (Docker) |
@@ -38,7 +44,7 @@ erDiagram
 | Table | Rows (1M run) | Notes |
 |---|---|---|
 | `persons` | 1,000,000 | Unique citizen ID, email and signature colour. Name, DOB, appearance, education, job, income, commute mode |
-| `households` | ~412k | Address (house/flat number, real street name, synthetic postcode), type, tenure |
+| `households` | ~411k | Address (house/flat number, real street name, synthetic postcode), type, tenure |
 | `relationships` | ~2M | Spouse, partner, parent, child, sibling, grandparent, grandchild, stored in both directions. Includes adult children who live at a different address |
 | `activities` | ~3M | One weekday per person: ordered stops with start/end minute |
 | `places` | ~25k | Real OSM shops, schools, universities, hospitals and offices, plus non-residential buildings as employers |
@@ -63,6 +69,7 @@ docker compose up -d api web                            # then open http://local
 - Different size or seed: `POPULATION=250000 SEED=7 docker compose --profile generate run --rm generator`. The pipeline is deterministic for a given seed.
 - Connect any SQL client to `localhost:5433` as user `city` / password `city` (full access) or `analyst` / `analyst` (read-only), database `city`, schema `city`.
 - After regenerating, restart the API (`docker compose restart api`) so it rebuilds the map snapshot.
+- Deep links: `http://localhost:8080/?person=4242&t=12:30` opens a resident's record at a given time.
 
 ### Local development
 
