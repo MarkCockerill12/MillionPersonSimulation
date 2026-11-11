@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.162.4",
     "numpy>=2.5.4",
     "orjson>=3.13.0",
+    "pandas>=3.1.1",
     "psycopg[binary,pool]>=3.3.8",
     "uvicorn[standard]>=0.54.0",
 ]

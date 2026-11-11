@@ -2,27 +2,37 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
 
+import psycopg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import ORJSONResponse
 
 from .db import analyst_pool, fetch_one, pool
 from .routers import analytics, people, sim, sql_console
+
+
+def _warm() -> None:
+    try:
+        sim.snapshot()
+    except (psycopg.Error, ValueError) as e:  # DB may be empty before the generator has run
+        print(f"snapshot warm-up skipped: {e}")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     pool.open()
     analyst_pool.open()
+    # warm the 1M-person map snapshot in the background so the first visitor doesn't wait
+    threading.Thread(target=_warm, daemon=True).start()
     yield
     pool.close()
     analyst_pool.close()
 
 
-app = FastAPI(title="MillionProfile", default_response_class=ORJSONResponse, lifespan=lifespan)
+app = FastAPI(title="MillionProfile", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=2048)
 

@@ -159,7 +159,8 @@ def compose_households(n_people: int, rng: np.random.Generator):
         t = types[rng.choice(len(types), p=tp)]
         loc = int(rng.choice(len(locs), p=lp))
         if t == "single":
-            age = int(np.clip(rng.gamma(4.5, 11) + 18, 18, 100))
+            age = rng.gamma(4.5, 11) + 18
+            age = int(age if age <= 96 else rng.uniform(60, 92))  # resample the tail instead of piling it at the cap
             fam += 1
             add(h, "head", age, sex(), fam, loc)
         elif t == "couple":
@@ -356,8 +357,14 @@ def assign_work_and_school(persons: pd.DataFrame, households: pd.DataFrame, plac
     # education
     edu = np.zeros(n, dtype=np.int8)
     adult = age >= 18
+    # district affluence: some neighbourhoods are richer and better-qualified than others
+    pdist = households["district_id"].to_numpy()[persons["hh"].to_numpy()]
+    affluence = rng.lognormal(0, 0.22, int(pdist.max()) + 1)
+    aff = affluence[pdist]
+    persons["affluence"] = aff
     e = rng.choice(len(EDU), n, p=[0.16, 0.22, 0.18, 0.10, 0.22, 0.10, 0.02])
-    edu[adult] = e[adult]
+    shift = np.clip(np.round(rng.normal(np.log(aff) * 3, 0.6)), -2, 2).astype(int)
+    edu[adult] = np.clip(e[adult] + shift[adult], 0, len(EDU) - 1)
     edu[(age >= 16) & (age < 18)] = 1
     edu[status == "student"] = np.maximum(edu[status == "student"], 2)
     persons["education_level"] = np.array(EDU, dtype=object)[edu]
@@ -378,7 +385,7 @@ def assign_work_and_school(persons: pd.DataFrame, households: pd.DataFrame, plac
     income = np.zeros(n)
     wk = occ_id > 0
     exp_factor = np.clip(0.75 + (age - 22) * 0.012, 0.7, 1.25)
-    income[wk] = med.loc[occ_id[wk]].to_numpy() * exp_factor[wk] * rng.lognormal(0, 0.28, wk.sum())
+    income[wk] = med.loc[occ_id[wk]].to_numpy() * exp_factor[wk] * aff[wk] ** 0.8 * rng.lognormal(0, 0.28, wk.sum())
     part_time = wk & (rng.random(n) < 0.24)
     income[part_time] *= 0.55
     income[status == "retired"] = rng.normal(16500, 5500, (status == "retired").sum()).clip(9000)
@@ -397,7 +404,10 @@ def assign_work_and_school(persons: pd.DataFrame, households: pd.DataFrame, plac
     work_places = places[places.category.isin(["workplace", "shop", "food_drink", "healthcare", "leisure",
                                                "school", "university"])].reset_index(drop=True)
     wxy = np.c_[work_places.x, work_places.y]
-    wcap = work_places.capacity.to_numpy().astype(float)
+    # capacity is visitors/pupils for some categories; convert to staff head-count for job weighting
+    staff_ratio = work_places.category.map({"school": 0.12, "university": 0.15, "shop": 0.6, "food_drink": 0.7,
+                                            "leisure": 0.3, "healthcare": 1.0, "workplace": 1.0}).fillna(1.0)
+    wcap = (work_places.capacity * staff_ratio).to_numpy().astype(float)
     wtree = cKDTree(wxy)
     commuters = np.flatnonzero(working & ~((status == "self_employed") & (rng.random(n) < 0.3)))  # some WFH
     wp = np.full(n, -1, dtype=np.int64)

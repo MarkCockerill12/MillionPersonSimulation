@@ -20,6 +20,18 @@ const tooltip = {
   cursor: { fill: 'rgba(201,211,214,.06)', stroke: 'rgba(201,211,214,.3)' },
 }
 
+// Category tick that wraps onto two lines instead of colliding with its neighbours.
+function WrapTick({ x, y, payload }: { x?: number; y?: number; payload?: { value: string } }) {
+  const words = label(String(payload?.value ?? '')).split(' ')
+  const mid = Math.ceil(words.length / 2)
+  const lines = words.length > 1 ? [words.slice(0, mid).join(' '), words.slice(mid).join(' ')] : words
+  return (
+    <text x={x} y={(y ?? 0) + 12} textAnchor="middle" fill={MUTED} fontSize={12}>
+      {lines.map((l, i) => <tspan key={i} x={x} dy={i ? 14 : 0}>{l}</tspan>)}
+    </text>
+  )
+}
+
 function toObjects(a: Analysis) {
   const cols = a.columns ?? []
   return (a.rows ?? []).map((r) => Object.fromEntries(cols.map((c, i) => [c, r[i]])))
@@ -52,7 +64,7 @@ export function Chart({ a }: { a: Analysis }) {
       <ResponsiveContainer width="100%" height={300}>
         <BarChart data={data} barCategoryGap="18%">
           <CartesianGrid vertical={false} stroke={GRID} />
-          <XAxis dataKey={x} {...axis} tickFormatter={(v) => label(String(v))} interval={0} fontSize={11} />
+          <XAxis dataKey={x} {...axis} tick={<WrapTick />} interval={0} height={40} />
           <YAxis {...axis} tickFormatter={(v) => compact.format(v)} width={48} />
           <Tooltip {...tooltip} labelFormatter={(v) => label(String(v))} formatter={(v, n) => [fmt(v), label(String(n))]} />
           {ys.map((y, i) => <Bar key={y} dataKey={y} fill={SERIES[i]} radius={[4, 4, 0, 0]} />)}

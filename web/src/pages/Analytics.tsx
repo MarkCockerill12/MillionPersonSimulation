@@ -54,12 +54,12 @@ export default function Analytics() {
         </p>
         {meta && (
           <dl className="totals">
-            <div><dt>Residents</dt><dd className="num">{n.format(meta.people)}</dd></div>
-            <div><dt>Households</dt><dd className="num">{n.format(meta.households)}</dd></div>
-            <div><dt>Family links</dt><dd className="num">{n.format(meta.relationships)}</dd></div>
-            <div><dt>Daily activities</dt><dd className="num">{n.format(meta.activities)}</dd></div>
-            <div><dt>Places</dt><dd className="num">{n.format(meta.places)}</dd></div>
-            <div><dt>Database size</dt><dd className="num">{meta.db_size}</dd></div>
+            <div><dt>Residents</dt><dd>{n.format(meta.people)}</dd></div>
+            <div><dt>Households</dt><dd>{n.format(meta.households)}</dd></div>
+            <div><dt>Family links</dt><dd>{n.format(meta.relationships)}</dd></div>
+            <div><dt>Daily activities</dt><dd>{n.format(meta.activities)}</dd></div>
+            <div><dt>Places</dt><dd>{n.format(meta.places)}</dd></div>
+            <div><dt>Database size</dt><dd>{meta.db_size}</dd></div>
           </dl>
         )}
       </header>

@@ -200,6 +200,7 @@ def build_places(b: gpd.GeoDataFrame, pois: gpd.GeoDataFrame, faker: Faker, rng:
     cap = p["category"].map(base_cap).astype(float)
     cap[p["subcategory"] == "hospital"] = 2500
     cap[p["subcategory"] == "kindergarten"] = 60
+    cap[p["subcategory"] == "college"] = 1500
     cap[p["subcategory"].isin(["supermarket", "mall", "department_store"])] = 120
     cap[p["subcategory"] == "stadium"] = 200
     p["capacity"] = (cap * rng.lognormal(0, 0.4, len(p))).round().clip(3).astype(np.int32)

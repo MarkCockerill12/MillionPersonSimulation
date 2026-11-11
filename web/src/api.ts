@@ -119,4 +119,6 @@ export const api = {
   },
 }
 
-export const label = (s: string | null | undefined) => (s ?? '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())
+const ACRONYMS: Record<string, string> = { gcse: 'GCSE', a_level: 'A level' }
+export const label = (s: string | null | undefined) =>
+  ACRONYMS[s ?? ''] ?? (s ?? '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())

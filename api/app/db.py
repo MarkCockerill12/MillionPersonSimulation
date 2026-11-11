@@ -13,7 +13,14 @@ ANALYST_DSN = os.environ.get("ANALYST_DATABASE_URL", "postgresql://analyst:analy
 
 pool = ConnectionPool(DSN, min_size=1, max_size=10, open=False,
                       kwargs={"options": "-c search_path=city,public -c statement_timeout=30000"})
-analyst_pool = ConnectionPool(ANALYST_DSN, min_size=0, max_size=4, open=False,
+
+
+def _reset(conn) -> None:
+    # Undo any SET a console user ran, so role defaults (read-only, timeout) apply to the next user.
+    conn.execute("RESET ALL")
+
+
+analyst_pool = ConnectionPool(ANALYST_DSN, min_size=0, max_size=4, open=False, reset=_reset,
                               kwargs={"options": "-c search_path=city,public", "autocommit": True})
 
 

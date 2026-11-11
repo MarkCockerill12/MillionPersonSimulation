@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import DeckGL from '@deck.gl/react'
 import { ScatterplotLayer, GeoJsonLayer } from '@deck.gl/layers'
-import type { MapViewState, PickingInfo } from '@deck.gl/core'
+import { WebMercatorViewport, type MapViewState, type PickingInfo } from '@deck.gl/core'
 import { Map } from 'react-map-gl/maplibre'
 import 'maplibre-gl/dist/maplibre-gl.css'
+import { setWorkerUrl } from 'maplibre-gl'
+// MapLibre 6 ships its tile worker as a separate ES module; let Vite bundle it and tell MapLibre where it is.
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
 import { api, type Person } from '../api'
 import { decode, positionsAt, AT_HOME, AT_S1, AT_S2, MOVING, type Snapshot } from '../sim'
 import { PersonPanel } from '../components/PersonPanel'
 import { TimeBar } from '../components/TimeBar'
 import { Search } from '../components/Search'
+
+setWorkerUrl(maplibreWorkerUrl)
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
 const INITIAL: MapViewState = { longitude: -1.8904, latitude: 52.4862, zoom: 10.6, pitch: 0, bearing: 0 }
@@ -65,7 +70,10 @@ export default function MapPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null)
   const [progress, setProgress] = useState<string>('Connecting to the database…')
   const [error, setError] = useState<string | null>(null)
-  const [minute, setMinute] = useState(8 * 60)
+  const [minute, setMinute] = useState(() => {
+    const t = new URLSearchParams(window.location.search).get('t')?.match(/^(\d{1,2}):(\d{2})$/)
+    return t ? Number(t[1]) * 60 + Number(t[2]) : 8 * 60 // ?t=HH:MM sets the starting clock
+  })
   const [playing, setPlaying] = useState(false)
   const [speed, setSpeed] = useState(12) // simulated minutes per real second
   const [colourBy, setColourBy] = useState<ColourBy>('activity')
@@ -139,10 +147,33 @@ export default function MapPage() {
     if (id == null) return
     api.person(id).then((p) => {
       setPerson(p)
-      if (fly) setViewState((v) => ({ ...v, longitude: p.lon, latitude: p.lat, zoom: 15, transitionDuration: 1200 }))
+      if (!fly) return
+      // frame the whole day (home, work, errands) between the side panels
+      const xs = p.schedule.map((s) => s.lon), ys = p.schedule.map((s) => s.lat)
+      const pad = 0.002
+      const vp = new WebMercatorViewport({ width: window.innerWidth, height: window.innerHeight })
+      const fit = vp.fitBounds([[Math.min(...xs) - pad, Math.min(...ys) - pad], [Math.max(...xs) + pad, Math.max(...ys) + pad]],
+        { padding: window.innerWidth > 1100 ? { left: 380, right: 450, top: 80, bottom: 130 } : 40 })
+      setViewState((v) => ({ ...v, longitude: fit.longitude, latitude: fit.latitude, zoom: Math.min(fit.zoom, 16), transitionDuration: 1200 }))
     }).catch((e) => setError(e.message))
     api.route(id).then(setRoute).catch(() => setRoute(null))
   }, [])
+
+  // ---- deep link: /?person=123 opens that record
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search)
+    const id = Number(q.get('person'))
+    if (!(id > 0)) return
+    const h = setTimeout(() => select(id, true), 0)
+    return () => clearTimeout(h)
+  }, [select])
+
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (selected != null) url.searchParams.set('person', String(selected))
+    else url.searchParams.delete('person')
+    window.history.replaceState(null, '', url)
+  }, [selected])
 
   const onClick = useCallback((info: PickingInfo) => {
     if (info.layer?.id === 'people' && info.index >= 0) select(info.index + 1)
