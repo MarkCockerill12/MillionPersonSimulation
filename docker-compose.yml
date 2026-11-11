@@ -1,0 +1,68 @@
+name: millionprofile
+
+services:
+  db:
+    image: pgrouting/pgrouting:17-3.5-3.8.0
+    environment:
+      POSTGRES_DB: city
+      POSTGRES_USER: city
+      POSTGRES_PASSWORD: city
+    command: >
+      postgres
+        -c shared_buffers=1GB
+        -c work_mem=64MB
+        -c maintenance_work_mem=1GB
+        -c effective_cache_size=3GB
+        -c max_wal_size=4GB
+        -c shared_preload_libraries=pg_stat_statements
+        -c jit=off
+    shm_size: 1gb
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U city -d city"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot job: builds the synthetic population and loads it.
+  #   docker compose --profile generate run --rm generator
+  generator:
+    profiles: ["generate"]
+    build: ./generator
+    environment:
+      DATABASE_URL: postgresql://city:city@db:5432/city
+      POPULATION: ${POPULATION:-1000000}
+      SEED: ${SEED:-42}
+    volumes:
+      - ./data:/data
+      - ./db:/db:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://city:city@db:5432/city
+      ANALYST_DATABASE_URL: postgresql://analyst:analyst@db:5432/city
+    volumes:
+      - ./sql:/sql:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

@@ -1,0 +1,18 @@
+[project]
+name = "generator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faker>=40.54.0",
+    "geopandas>=1.2.0",
+    "numpy>=2.5.4",
+    "osmium>=4.3.2",
+    "osmnx>=2.1.1",
+    "pandas>=3.1.1",
+    "psycopg[binary]>=3.3.8",
+    "pyarrow>=26.0.1",
+    "scipy>=1.18.1",
+    "shapely>=2.2.0",
+]
