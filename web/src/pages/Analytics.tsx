@@ -8,7 +8,12 @@ function Card({ id }: { id: string }) {
   const [a, setA] = useState<Analysis | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [view, setView] = useState<'chart' | 'table' | 'sql'>('chart')
+  const [running, setRunning] = useState(false)
   useEffect(() => { api.analysis(id).then(setA).catch((e) => setErr(e.message)) }, [id])
+  const runLive = () => {
+    setRunning(true)
+    api.analysis(id, true).then(setA).catch((e) => setErr(e.message)).finally(() => setRunning(false))
+  }
 
   return (
     <article className="card">
@@ -23,7 +28,14 @@ function Card({ id }: { id: string }) {
             {{ chart: 'Chart', table: 'Table', sql: 'SQL' }[v]}
           </button>
         ))}
-        {a?.elapsed_ms != null && <span className="elapsed num">Ran in {n.format(a.elapsed_ms)} ms</span>}
+        {a?.elapsed_ms != null && (
+          <span className="elapsed num">
+            {a.source === 'precomputed'
+              ? `Served in ${a.served_ms} ms (query takes ${n.format(a.elapsed_ms)} ms)`
+              : `Ran live in ${n.format(a.elapsed_ms)} ms`}
+          </span>
+        )}
+        <button className="run-live" onClick={runLive} disabled={running}>{running ? 'Running…' : 'Run live'}</button>
       </div>
       <div className="body">
         {err && <p className="status error">{err}</p>}
@@ -50,7 +62,8 @@ export default function Analytics() {
       <header className="page-head">
         <h1>What the database says about the city</h1>
         <p>
-          Every panel is one SQL query from <code>sql/analysis/</code>, run live against PostgreSQL. Open the SQL tab to read it.
+          Every panel is one SQL query from <code>sql/analysis/</code>. Results are computed once when the city is
+          generated, so the page opens instantly. Select Run live to re-run a query against all the records, or open the SQL tab to read it.
         </p>
         {meta && (
           <dl className="totals">

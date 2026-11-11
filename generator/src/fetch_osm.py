@@ -1,6 +1,6 @@
 """Step 1: extract real OpenStreetMap data for the city.
 
-Source: the Geofabrik West Midlands extract (one ~60 MB .osm.pbf download),
+Source: the city's Geofabrik regional extract (one .osm.pbf download, see cities.py),
 parsed locally with pyosmium. The city boundary comes from Nominatim.
 
 Outputs (cached in data/osm/, each skipped if present):
@@ -25,7 +25,6 @@ import osmnx as ox
 import shapely
 from osmium.filter import KeyFilter
 
-PBF_URL = "https://download.geofabrik.de/europe/united-kingdom/england/west-midlands-latest.osm.pbf"
 BUILDING_COLS = ["building", "building:levels", "name", "amenity", "shop", "office", "addr:street", "addr:housenumber"]
 POI_COLS = ["name", "amenity", "shop", "leisure", "office"]
 POI_AMENITY = {"school", "college", "university", "hospital", "clinic", "doctors", "pub", "restaurant", "cafe",
@@ -90,7 +89,11 @@ def extract_features(pbf: Path, poly: shapely.Geometry, out: Path) -> None:
 
 
 def extract_roads(pbf: Path, poly: shapely.Geometry, out: Path) -> None:
-    box = poly.bounds
+    # Keep roads a little beyond the boundary: parts of a city (e.g. Amsterdam-Zuidoost) can be linked
+    # to the rest only via roads through neighbouring municipalities. Clipping exactly to the boundary
+    # would cut them off into a separate network and break routing there.
+    area = poly.convex_hull.buffer(0.03)
+    box = area.bounds
     g = nx.MultiDiGraph(crs="epsg:4326")
     for w in osmium.FileProcessor(str(pbf)).with_locations().with_filter(KeyFilter("highway")):
         if not w.is_way():
@@ -119,30 +122,25 @@ def extract_roads(pbf: Path, poly: shapely.Geometry, out: Path) -> None:
                 g.add_edge(v, u, **{**attrs, "reversed": True})
     print(f"  raw road graph: {g.number_of_nodes():,} nodes")
     g = ox.distance.add_edge_lengths(g)
-    g = ox.truncate.truncate_graph_polygon(g, poly)
+    g = ox.truncate.truncate_graph_polygon(g, area)
     g = ox.truncate.largest_component(g, strongly=True)
     g = ox.simplify_graph(g)
     ox.save_graphml(g, out / "roads.graphml")
     print(f"  roads.graphml: {g.number_of_nodes():,} nodes / {g.number_of_edges():,} edges")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--place", default="Birmingham, West Midlands, England")
-    ap.add_argument("--out", default="../data/osm")
-    ap.add_argument("--pbf", default=None, help="west-midlands-latest.osm.pbf (downloaded if missing)")
-    args = ap.parse_args()
-    out = Path(args.out)
+def fetch(city, out: Path, pbf: Path | None = None) -> None:
+    """Download and extract everything for `city` (a cities.City) into `out`."""
     out.mkdir(parents=True, exist_ok=True)
-    pbf = Path(args.pbf) if args.pbf else out.parent / "pbf" / "west-midlands-latest.osm.pbf"
+    pbf = pbf or out.parent.parent / "pbf" / city.pbf_url.rsplit("/", 1)[-1]
     if not pbf.exists():
         pbf.parent.mkdir(parents=True, exist_ok=True)
-        print(f"downloading {PBF_URL}")
-        urllib.request.urlretrieve(PBF_URL, pbf)
+        print(f"downloading {city.pbf_url}", flush=True)
+        urllib.request.urlretrieve(city.pbf_url, pbf)
 
     bpath = out / "boundary.parquet"
     if not bpath.exists():
-        ox.geocode_to_gdf(args.place)[["geometry"]].to_parquet(bpath)
+        ox.geocode_to_gdf(city.nominatim)[["geometry"]].to_parquet(bpath)
     poly = gpd.read_parquet(bpath).geometry.iloc[0]
 
     if not all((out / f).exists() for f in ("buildings.parquet", "pois.parquet", "suburbs.parquet")):
@@ -151,6 +149,18 @@ def main() -> None:
     if not (out / "roads.graphml").exists():
         print("extracting road network", flush=True)
         extract_roads(pbf, poly, out)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--city", default="amsterdam")
+    ap.add_argument("--out", default=None, help="defaults to ../data/osm/<city>")
+    ap.add_argument("--pbf", default=None, help="local .osm.pbf (downloaded if missing)")
+    args = ap.parse_args()
+    out = Path(args.out) if args.out else Path("../data/osm") / args.city
+    from cities import get  # script mode: src/ is on sys.path
+
+    fetch(get(args.city), out, Path(args.pbf) if args.pbf else None)
 
 
 if __name__ == "__main__":

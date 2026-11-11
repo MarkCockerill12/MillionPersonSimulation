@@ -84,9 +84,23 @@ export interface Analysis {
   columns?: string[]
   rows?: (string | number | null)[][]
   elapsed_ms?: number
+  served_ms?: number
+  source?: 'precomputed' | 'live'
+}
+
+export interface City {
+  key: string
+  name: string
+  country: string
+  currency: string
+  mode_labels: Record<string, string>
+  generated_at?: string
+  generation_seconds?: number
+  steps?: Record<string, number>
 }
 
 export interface Meta {
+  city: City | null
   people: number
   households: number
   places: number
@@ -109,7 +123,7 @@ export const api = {
   route: (id: number) => get<GeoJSON.FeatureCollection>(`/api/people/${id}/route`),
   search: (q: string) => get<Member[]>(`/api/search?q=${encodeURIComponent(q)}`),
   analyses: () => get<Analysis[]>('/api/analytics'),
-  analysis: (id: string) => get<Analysis>(`/api/analytics/${id}`),
+  analysis: (id: string, live = false) => get<Analysis>(`/api/analytics/${id}${live ? '?live=1' : ''}`),
   schema: () => get<Record<string, { name: string; type: string }[]>>('/api/sql/schema'),
   sql: async (sql: string) => {
     const r = await fetch('/api/sql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql }) })
@@ -119,6 +133,6 @@ export const api = {
   },
 }
 
-const ACRONYMS: Record<string, string> = { gcse: 'GCSE', a_level: 'A level' }
+const ACRONYMS: Record<string, string> = { upper_secondary: 'Upper secondary' }
 export const label = (s: string | null | undefined) =>
   ACRONYMS[s ?? ''] ?? (s ?? '').replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase())

@@ -4,17 +4,18 @@ import { fmtTime } from '../sim'
 interface Props {
   person: Person | null
   route: GeoJSON.FeatureCollection | null
+  currency: string
+  modeLabels: Record<string, string>
   onClose: () => void
   onSelect: (id: number) => void
 }
-
-const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 })
 
 function address(p: Person) {
   return `${p.flat_number ? `Flat ${p.flat_number}, ` : ''}${p.house_number} ${p.street}`
 }
 
-export function PersonPanel({ person: p, route, onClose, onSelect }: Props) {
+export function PersonPanel({ person: p, route, currency, modeLabels, onClose, onSelect }: Props) {
+  const money = new Intl.NumberFormat('en-GB', { style: 'currency', currency, maximumFractionDigits: 0 })
   const km = route?.features.reduce((s, f) => s + Number(f.properties?.length_m ?? 0), 0) ?? 0
   return (
     <aside className="record" aria-label="Resident record">
@@ -34,9 +35,9 @@ export function PersonPanel({ person: p, route, onClose, onSelect }: Props) {
             <div><dt>Born</dt><dd className="num">{new Date(p.date_of_birth).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</dd></div>
             <div><dt>Signature colour</dt><dd className="num">{p.signature_colour}</dd></div>
             <div><dt>Marital status</dt><dd>{label(p.marital_status)}</dd></div>
-            <div className="wide"><dt>Home</dt><dd>{address(p)}<br />{p.district}, Birmingham {p.postcode}</dd></div>
+            <div className="wide"><dt>Home</dt><dd>{address(p)}<br />{p.postcode} {p.district}</dd></div>
             <div className="wide"><dt>Contact</dt><dd>{p.email}<br /><span className="num">{p.phone}</span></dd></div>
-            <div><dt>Income</dt><dd className="num">{gbp.format(p.annual_income)}</dd></div>
+            <div><dt>Income</dt><dd className="num">{money.format(p.annual_income)}</dd></div>
             <div><dt>Education</dt><dd>{label(p.education_level)}</dd></div>
             {p.workplace && <div className="wide"><dt>Works at</dt><dd>{p.workplace}{p.sector ? ` (${p.sector})` : ''}</dd></div>}
             {p.school && <div className="wide"><dt>Studies at</dt><dd>{p.school}</dd></div>}
@@ -56,13 +57,13 @@ export function PersonPanel({ person: p, route, onClose, onSelect }: Props) {
                     <span className="num t">{fmtTime(s.start_min)}</span>
                     <span><strong>{s.activity_type === 'home' ? 'Home' : s.place_name}</strong>
                       {s.activity_type !== 'home' && <small> {label(s.activity_type)}</small>}
-                      {next && <small className="leg">Leaves {fmtTime(s.end_min)} by {p.commute_mode === 'none' ? 'foot' : p.commute_mode}</small>}
+                      {next && <small className="leg">Leaves {fmtTime(s.end_min)} by {p.commute_mode === 'none' ? 'foot' : (modeLabels[p.commute_mode] ?? p.commute_mode).toLowerCase()}</small>}
                     </span>
                   </li>
                 )
               })}
             </ol>
-            {km > 0 && <p className="hint">Gold line: road route from pgRouting, {(km / 1000).toFixed(1)} km in total.</p>}
+            {km > 0 && <p className="hint">Gold line: shortest road route, {(km / 1000).toFixed(1)} km in total.</p>}
             {p.schedule.length === 1 && <p className="hint">Stays at home all day.</p>}
           </section>
 

@@ -125,3 +125,20 @@ CREATE TABLE activities (
     end_min       smallint NOT NULL,
     PRIMARY KEY (person_id, seq)
 );
+
+-- ---------------------------------------------------------------- run metadata
+-- City configuration and generation timings, written by the generator.
+CREATE TABLE meta (
+    key   text PRIMARY KEY,
+    value jsonb NOT NULL
+);
+
+-- Results of every sql/analysis/*.sql query, computed once at generation time so the
+-- dashboard loads instantly. The API can still re-run any query live on request.
+CREATE TABLE analytics_results (
+    analysis_id text PRIMARY KEY,
+    columns     jsonb       NOT NULL,
+    rows        jsonb       NOT NULL,
+    elapsed_ms  integer     NOT NULL,
+    computed_at timestamptz NOT NULL DEFAULT now()
+);

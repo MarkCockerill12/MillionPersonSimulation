@@ -1,6 +1,7 @@
 -- Runs after bulk load: constraints, indexes, derived views, stats.
 SET search_path = city, public;
 SET maintenance_work_mem = '1GB';
+SET max_parallel_maintenance_workers = 4;   -- build big indexes with parallel workers
 
 -- ---------------------------------------------------------------- constraints
 ALTER TABLE buildings  ADD FOREIGN KEY (district_id) REFERENCES districts;

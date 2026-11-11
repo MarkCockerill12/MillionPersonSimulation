@@ -1,11 +1,12 @@
 """Synthetic population: households, people, family links, jobs and schools.
 
-Distributions are loosely calibrated to ONS Census 2021 figures for Birmingham
-(household size mix, age structure, employment rate, commute mode share).
+Demographic distributions are loosely calibrated to European census figures (household size
+mix, age structure, employment rate). City-specific behaviour comes from cities.py.
 """
 
 from __future__ import annotations
 
+import bisect
 import unicodedata
 from dataclasses import dataclass
 
@@ -16,11 +17,19 @@ from scipy.spatial import cKDTree
 
 REF_DATE = np.datetime64("2026-01-01")
 
-# Name locales (all Latin script) and their population share.
-LOCALES = {
-    "en_GB": 0.62, "en_IN": 0.13, "en_IE": 0.04, "pl_PL": 0.04, "yo_NG": 0.03, "en_US": 0.04,
-    "it_IT": 0.02, "ro_RO": 0.02, "fr_FR": 0.02, "es_ES": 0.02, "pt_PT": 0.02,
-}
+from .cities import CITIES, City
+
+# Set by configure(); defaults to the first configured city.
+CITY: City = next(iter(CITIES.values()))
+LOCALES: dict[str, float] = dict(CITY.name_locales)
+
+
+def configure(city: City) -> None:
+    """Point the population model at a city (names, formats, pay, travel behaviour)."""
+    global CITY, LOCALES
+    CITY = city
+    LOCALES = dict(city.name_locales)
+
 
 HOUSEHOLD_TYPES = {  # type -> probability
     "single": 0.29, "couple": 0.23, "couple_with_children": 0.23, "single_parent": 0.10,
@@ -31,7 +40,7 @@ COLOURS = {"blue": 0.24, "green": 0.13, "purple": 0.11, "red": 0.09, "black": 0.
            "orange": 0.05, "pink": 0.05, "yellow": 0.04, "grey": 0.03, "white": 0.03, "navy": 0.03,
            "turquoise": 0.02, "gold": 0.02, "maroon": 0.02, "lilac": 0.01}
 BLOOD = {"O+": 0.35, "A+": 0.30, "B+": 0.08, "AB+": 0.02, "O-": 0.13, "A-": 0.08, "B-": 0.02, "AB-": 0.02}
-EDU = ["none", "gcse", "a_level", "apprenticeship", "bachelors", "masters", "doctorate"]
+EDU = ["none", "secondary", "upper_secondary", "vocational", "bachelors", "masters", "doctorate"]
 
 # title, sector, median salary (GBP), minimum education index
 OCCUPATIONS = [
@@ -51,7 +60,7 @@ OCCUPATIONS = [
     ("Marketing Executive", "Business Services", 33000, 4), ("Teacher", "Education", 41000, 4),
     ("Accountant", "Finance", 48000, 4), ("Software Developer", "Technology", 52000, 4),
     ("Data Analyst", "Technology", 40000, 4), ("Civil Engineer", "Engineering", 47000, 4),
-    ("Solicitor", "Legal", 58000, 4), ("Pharmacist", "Health & Social Care", 47500, 5),
+    ("Lawyer", "Legal", 58000, 4), ("Pharmacist", "Health & Social Care", 47500, 5),
     ("Architect", "Construction", 50000, 5), ("Doctor", "Health & Social Care", 72000, 5),
     ("University Lecturer", "Education", 52000, 6), ("Research Scientist", "Science", 46000, 6),
     ("IT Manager", "Technology", 62000, 4), ("Operations Director", "Business Services", 85000, 4),
@@ -64,6 +73,11 @@ class Population:
     persons: pd.DataFrame
     relationships: pd.DataFrame
     occupations: pd.DataFrame
+
+
+def _pick(probs: dict[str, float], k: int, rng: np.random.Generator) -> np.ndarray:
+    labels, p = _weighted(probs)
+    return np.array(labels, dtype=object)[rng.choice(len(labels), k, p=p)]
 
 
 def _weighted(d: dict) -> tuple[list, np.ndarray]:
@@ -92,10 +106,65 @@ def _ascii(s: str) -> str:
 
 
 # --------------------------------------------------------------------- composition
+class _Draws:
+    """Buffered random numbers for the per-household Python loop.
+
+    numpy scalar calls cost ~1-20 µs each (rng.choice with p= is the worst); pulling from
+    pre-generated Python lists costs ~50 ns. Over a million people this is the difference
+    between minutes and seconds.
+    """
+
+    def __init__(self, rng: np.random.Generator, size: int = 1 << 20) -> None:
+        self.rng, self.size = rng, size
+        self._u: list[float] = []
+        self._z: list[float] = []
+        self._g: list[float] = []
+        self.iu = self.iz = self.ig = 0
+
+    def u(self) -> float:
+        if self.iu >= len(self._u):
+            self._u, self.iu = self.rng.random(self.size).tolist(), 0
+        self.iu += 1
+        return self._u[self.iu - 1]
+
+    def z(self) -> float:
+        if self.iz >= len(self._z):
+            self._z, self.iz = self.rng.standard_normal(self.size).tolist(), 0
+        self.iz += 1
+        return self._z[self.iz - 1]
+
+    def gamma(self) -> float:  # shape 4.5, scale 11: adult age above 18 for people living alone
+        if self.ig >= len(self._g):
+            self._g, self.ig = self.rng.gamma(4.5, 11, self.size // 4).tolist(), 0
+        self.ig += 1
+        return self._g[self.ig - 1]
+
+    def normal(self, mu: float, sd: float) -> float:
+        return mu + sd * self.z()
+
+    def integers(self, lo: int, hi: int) -> int:
+        return lo + int(self.u() * (hi - lo))
+
+    def pick(self, cum: list[float]) -> int:
+        return bisect.bisect_right(cum, self.u() * cum[-1])
+
+
+def _clip(x: float, lo: float, hi: float) -> int:
+    return int(min(max(x, lo), hi))
+
+
+def _cum(p) -> list[float]:
+    return np.cumsum(p).tolist()
+
+
 def compose_households(n_people: int, rng: np.random.Generator):
     """Build household membership + intra-household relationships (no names yet)."""
     types, tp = _weighted(HOUSEHOLD_TYPES)
-    locs, lp = _weighted(LOCALES)
+    _, lp = _weighted(LOCALES)
+    type_cum, loc_cum = _cum(tp), _cum(lp)
+    kids_cwc, kids_sp, kids_mg = _cum([0.38, 0.40, 0.15, 0.05, 0.02]), _cum([0.5, 0.35, 0.15]), _cum([0.35, 0.45, 0.2])
+    sharers = _cum([0.35, 0.35, 0.2, 0.1])
+    d = _Draws(rng)
 
     hh_type: list[str] = []
     hh_loc: list[int] = []
@@ -117,18 +186,17 @@ def compose_households(n_people: int, rng: np.random.Generator):
         rels.append((a, b, ab)); rels.append((b, a, ba))
 
     def sex() -> str:
-        return "F" if rng.random() < 0.51 else "M"
+        return "F" if d.u() < 0.51 else "M"
 
     def couple(h: int, loc: int, age: int) -> tuple[int, int]:
         nonlocal fam
         s1 = sex()
-        same = rng.random() < 0.03
-        s2 = s1 if same else ("M" if s1 == "F" else "F")
-        a2 = int(np.clip(age + rng.normal(0, 3.5), 18, 99))
+        s2 = s1 if d.u() < 0.03 else ("M" if s1 == "F" else "F")
+        a2 = _clip(age + d.normal(0, 3.5), 18, 99)
         fam += 1
         f1 = fam
-        married = rng.random() < 0.65
-        if married and rng.random() < 0.8:
+        married = d.u() < 0.65
+        if married and d.u() < 0.8:
             f2 = f1
         else:
             fam += 1
@@ -140,10 +208,10 @@ def compose_households(n_people: int, rng: np.random.Generator):
 
     def children(h: int, loc: int, parents: list[int], n: int, family: int) -> list[int]:
         youngest_parent = min(p_age[p] for p in parents)
-        kids = []
-        first_gap = rng.integers(20, 36)
+        kids: list[int] = []
+        first_gap = d.integers(20, 36)
         for i in range(n):
-            age = youngest_parent - first_gap - i * rng.integers(1, 4)
+            age = youngest_parent - first_gap - i * d.integers(1, 4)
             if age < 0:
                 break
             k = add(h, "child", age, sex(), family, loc)
@@ -156,39 +224,35 @@ def compose_households(n_people: int, rng: np.random.Generator):
 
     h = 0
     while len(p_hh) < n_people:
-        t = types[rng.choice(len(types), p=tp)]
-        loc = int(rng.choice(len(locs), p=lp))
+        t = types[d.pick(type_cum)]
+        loc = d.pick(loc_cum)
         if t == "single":
-            age = rng.gamma(4.5, 11) + 18
-            age = int(age if age <= 96 else rng.uniform(60, 92))  # resample the tail instead of piling it at the cap
+            age = d.gamma() + 18
+            age = int(age if age <= 96 else 60 + d.u() * 32)  # resample the tail instead of piling it at the cap
             fam += 1
             add(h, "head", age, sex(), fam, loc)
         elif t == "couple":
-            age = int(np.clip(rng.choice([rng.normal(30, 6), rng.normal(64, 10)]), 19, 98))
+            age = _clip(d.normal(30, 6) if d.u() < 0.5 else d.normal(64, 10), 19, 98)
             couple(h, loc, age)
         elif t == "couple_with_children":
-            age = int(np.clip(rng.normal(41, 8), 22, 70))
+            age = _clip(d.normal(41, 8), 22, 70)
             a, b = couple(h, loc, age)
-            n = rng.choice([1, 2, 3, 4, 5], p=[0.38, 0.40, 0.15, 0.05, 0.02])
-            if not children(h, loc, [a, b], n, p_family[a]):
+            if not children(h, loc, [a, b], d.pick(kids_cwc) + 1, p_family[a]):
                 t = "couple"
         elif t == "single_parent":
             fam += 1
-            age = int(np.clip(rng.normal(38, 8), 19, 65))
-            s = "F" if rng.random() < 0.86 else "M"
-            a = add(h, "head", age, s, fam, loc)
-            children(h, loc, [a], rng.choice([1, 2, 3], p=[0.5, 0.35, 0.15]), fam)
+            age = _clip(d.normal(38, 8), 19, 65)
+            a = add(h, "head", age, "F" if d.u() < 0.86 else "M", fam, loc)
+            children(h, loc, [a], d.pick(kids_sp) + 1, fam)
         elif t == "multigenerational":
-            age = int(np.clip(rng.normal(42, 7), 26, 60))
+            age = _clip(d.normal(42, 7), 26, 60)
             a, b = couple(h, loc, age)
-            kids = children(h, loc, [a, b], rng.choice([1, 2, 3], p=[0.35, 0.45, 0.2]), p_family[a])
-            nga = rng.choice([1, 2], p=[0.55, 0.45])
-            gage = int(min(100, p_age[a] + rng.integers(24, 34)))
+            kids = children(h, loc, [a, b], d.pick(kids_mg) + 1, p_family[a])
+            gage = min(100, p_age[a] + d.integers(24, 34))
             g1 = add(h, "parent", gage, sex(), p_family[a], loc)
             gps = [g1]
-            if nga == 2:
-                g2 = add(h, "parent", min(100, gage + int(rng.integers(-4, 5))),
-                         "M" if p_sex[g1] == "F" else "F", p_family[a], loc)
+            if d.u() < 0.45:
+                g2 = add(h, "parent", min(100, gage + d.integers(-4, 5)), "M" if p_sex[g1] == "F" else "F", p_family[a], loc)
                 link(g1, g2, "spouse", "spouse")
                 gps.append(g2)
             for g in gps:
@@ -196,11 +260,9 @@ def compose_households(n_people: int, rng: np.random.Generator):
                 for k in kids:
                     link(g, k, "grandparent", "grandchild")
         else:  # shared house of unrelated adults
-            n = rng.choice([2, 3, 4, 5], p=[0.35, 0.35, 0.2, 0.1])
-            for i in range(n):
+            for i in range(d.pick(sharers) + 2):
                 fam += 1
-                add(h, "head" if i == 0 else "housemate", int(np.clip(rng.normal(25, 4), 18, 45)), sex(), fam,
-                    int(rng.choice(len(locs), p=lp)))
+                add(h, "head" if i == 0 else "housemate", _clip(d.normal(25, 4), 18, 45), sex(), fam, d.pick(loc_cum))
         hh_type.append(t)
         hh_loc.append(loc)
         h += 1
@@ -218,33 +280,43 @@ def link_relatives_across_households(persons: pd.DataFrame, rng: np.random.Gener
     """Adult children who moved out stay linked to their parents (and siblings still at home).
 
     The young adult's surname group is re-pointed at the parents' group so the
-    family shares a surname across two addresses.
+    family shares a surname across two addresses. Works on plain arrays: persons are
+    stored contiguously by household, so a household's members are one slice.
     """
-    heads = persons[persons.role == "head"]
-    young = heads[heads.age.between(20, 40)]
+    role = persons["role"].to_numpy()
+    age = persons["age"].to_numpy()
+    family = persons["family"].to_numpy()
+    loc = persons["loc"].to_numpy()
+    hh = persons["hh"].to_numpy()
+    hh_start = np.r_[0, np.flatnonzero(np.diff(hh)) + 1]
+    hh_end = np.r_[hh_start[1:], len(hh)]
+
+    is_head = role == "head"
+    young = np.flatnonzero(is_head & (age >= 20) & (age <= 40))
     young = young[rng.random(len(young)) < 0.35]
-    old_heads = persons[(persons.role == "head") & persons.age.between(48, 85)]
-    by_loc = {loc: g.index.to_numpy() for loc, g in old_heads.groupby("loc")}
-    hh_members = persons.groupby("hh").groups
+    old = np.flatnonzero(is_head & (age >= 48) & (age <= 85))
+    by_loc = {int(lv): old[loc[old] == lv] for lv in np.unique(loc[old])}
+    draws = rng.random(len(young))
+
     used: set[int] = set()
     remap: dict[int, int] = {}
     pairs: list[tuple[int, int, str]] = []
-    for idx, row in young.iterrows():
-        cand = by_loc.get(row["loc"])
-        if cand is None:
+    for idx, r in zip(young.tolist(), draws.tolist(), strict=True):
+        cand = by_loc.get(int(loc[idx]))
+        if cand is None or len(cand) == 0:
             continue
-        ph = int(cand[rng.integers(len(cand))])
-        if ph in used or persons.at[ph, "age"] - row["age"] < 20:
+        ph = int(cand[int(r * len(cand))])
+        if ph in used or age[ph] - age[idx] < 20:
             continue
         used.add(ph)
-        remap[row["family"]] = persons.at[ph, "family"]
-        for m in hh_members[persons.at[ph, "hh"]]:
-            role = persons.at[m, "role"]
-            if role in ("head", "partner"):
+        remap[int(family[idx])] = int(family[ph])
+        h = hh[ph]
+        for m in range(hh_start[h], hh_end[h]):
+            if role[m] in ("head", "partner"):
                 pairs += [(m, idx, "parent"), (idx, m, "child")]
-            elif role == "child":
+            elif role[m] == "child":
                 pairs += [(m, idx, "sibling"), (idx, m, "sibling")]
-    persons["family"] = persons["family"].replace(remap)
+    persons["family"] = persons["family"].map(remap).fillna(persons["family"]).astype(np.int64)
     return pd.DataFrame(pairs, columns=["a", "b", "relationship"])
 
 
@@ -288,17 +360,17 @@ def assign_identity(persons: pd.DataFrame, rng: np.random.Generator) -> pd.DataF
     codes = rng.choice(32 ** 8, n, replace=False) if n < 5_000_000 else np.arange(n) * 7919 % (32 ** 8)
     digits = np.stack([(codes // 32 ** i) % 32 for i in range(8)], axis=1)
     chars = alphabet[digits]
-    persons["citizen_id"] = ["BHM-" + "".join(c[:4]) + "-" + "".join(c[4:]) for c in chars]
+    persons["citizen_id"] = [CITY.id_prefix + "-" + "".join(c[:4]) + "-" + "".join(c[4:]) for c in chars]
     colours = rng.choice(256 ** 3, n, replace=False)
     persons["signature_colour"] = [f"#{c:06X}" for c in colours]
 
-    domains = np.array(["mailbox.example", "brum.example", "postbox.example", "inbox.example", "letter.example"])
+    domains = np.array(CITY.email_domains)
     base = [f"{_ascii(f)}.{_ascii(l)}" for f, l in zip(persons["first_name"], persons["last_name"])]
     base = pd.Series(base)
     suffix = base.groupby(base).cumcount()
     persons["email"] = (base + np.where(suffix > 0, suffix.astype(str), "") + "@" +
                         rng.choice(domains, n)).to_numpy()
-    persons["phone"] = ["07700 900" + f"{x:03d}" for x in rng.integers(0, 1000, n)]  # Ofcom drama range
+    persons["phone"] = CITY.phone(rng, n)  # fictional number ranges, see cities.py
 
     age = persons["age"].to_numpy()
     days = rng.integers(0, 365, n)
@@ -309,11 +381,8 @@ def assign_identity(persons: pd.DataFrame, rng: np.random.Generator) -> pd.DataF
     bk, bp = _weighted(BLOOD)
     persons["blood_type"] = rng.choice(bk, n, p=bp)
 
-    south_asian_or_african = persons["loc"].isin([locs.index("en_IN"), locs.index("yo_NG")]).to_numpy()
-    eye = rng.choice(["brown", "blue", "green", "hazel", "grey"], n, p=[0.42, 0.32, 0.1, 0.11, 0.05])
-    eye[south_asian_or_african] = rng.choice(["brown", "hazel"], south_asian_or_african.sum(), p=[0.93, 0.07])
-    hair = rng.choice(["brown", "black", "blonde", "red", "auburn"], n, p=[0.45, 0.2, 0.22, 0.05, 0.08])
-    hair[south_asian_or_african] = rng.choice(["black", "brown"], south_asian_or_african.sum(), p=[0.85, 0.15])
+    eye = rng.choice(["brown", "blue", "green", "hazel", "grey"], n, p=[0.40, 0.34, 0.1, 0.11, 0.05])
+    hair = rng.choice(["brown", "black", "blonde", "red", "auburn"], n, p=[0.44, 0.18, 0.25, 0.05, 0.08])
     greying = (age > 50) & (rng.random(n) < (age - 50) / 35)
     hair[greying] = np.where(rng.random(greying.sum()) < 0.8, "grey", "white")
     hair[(age > 40) & (persons["sex"].to_numpy() == "M") & (rng.random(n) < 0.15)] = "bald"
@@ -385,14 +454,15 @@ def assign_work_and_school(persons: pd.DataFrame, households: pd.DataFrame, plac
     income = np.zeros(n)
     wk = occ_id > 0
     exp_factor = np.clip(0.75 + (age - 22) * 0.012, 0.7, 1.25)
-    income[wk] = med.loc[occ_id[wk]].to_numpy() * exp_factor[wk] * aff[wk] ** 0.8 * rng.lognormal(0, 0.28, wk.sum())
+    income[wk] = CITY.salary_factor * med.loc[occ_id[wk]].to_numpy() * exp_factor[wk] * aff[wk] ** 0.8 * rng.lognormal(0, 0.28, wk.sum())
     part_time = wk & (rng.random(n) < 0.24)
     income[part_time] *= 0.55
-    income[status == "retired"] = rng.normal(16500, 5500, (status == "retired").sum()).clip(9000)
-    income[status == "unemployed"] = rng.normal(5200, 1500, (status == "unemployed").sum()).clip(0)
-    income[status == "carer"] = rng.normal(4400, 1200, (status == "carer").sum()).clip(0)
+    f = CITY.salary_factor
+    income[status == "retired"] = rng.normal(16500 * f, 5500 * f, (status == "retired").sum()).clip(9000 * f)
+    income[status == "unemployed"] = rng.normal(5200 * f, 1500 * f, (status == "unemployed").sum()).clip(0)
+    income[status == "carer"] = rng.normal(4400 * f, 1200 * f, (status == "carer").sum()).clip(0)
     income[status == "student"] = np.where(rng.random((status == "student").sum()) < 0.35,
-                                           rng.normal(7000, 2500, (status == "student").sum()), 0).clip(0)
+                                           rng.normal(7000 * f, 2500 * f, (status == "student").sum()), 0).clip(0)
     persons["annual_income"] = (np.round(income / 100) * 100).astype(np.int32)
     persons["part_time"] = part_time
 
@@ -452,18 +522,14 @@ def assign_work_and_school(persons: pd.DataFrame, households: pd.DataFrame, plac
     dist = np.hypot(dx - hx, dy - hy)
     hh_car = households["has_car"].to_numpy()[persons["hh"].to_numpy()]
     mode = np.full(n, "none", dtype=object)
-    u = rng.random(n)
-    walkable = dist < 1200
-    mode[has_dest & walkable] = np.where(u[has_dest & walkable] < 0.55, "walk",
-                                         np.where(u[has_dest & walkable] < 0.60, "cycle", "car"))
+    mc = CITY.modes
+    walkable = dist < mc.walk_max_m
     far = has_dest & ~walkable
     can_drive = hh_car & (age >= 17)
-    mode[far & can_drive] = np.where(u[far & can_drive] < 0.72, "car",
-                                     np.where(u[far & can_drive] < 0.88, "bus",
-                                              np.where(u[far & can_drive] < 0.97, "train", "cycle")))
-    mode[far & ~can_drive] = np.where(u[far & ~can_drive] < 0.72, "bus",
-                                      np.where(u[far & ~can_drive] < 0.86, "train",
-                                               np.where(u[far & ~can_drive] < 0.92, "cycle", "walk")))
+    for mask, probs in [(has_dest & walkable, mc.short), (far & can_drive, mc.far_with_car),
+                        (far & ~can_drive, mc.far_without_car)]:
+        mode[mask] = _pick(probs, int(mask.sum()), rng)
+    mode[has_dest & walkable & ~can_drive & (mode == "car")] = "walk"
     young_kid_far = (status == "pupil") & (age < 11) & ~walkable
     mode[young_kid_far & hh_car] = "car"
     persons["commute_mode"] = mode
@@ -474,28 +540,27 @@ def assign_work_and_school(persons: pd.DataFrame, households: pd.DataFrame, plac
 def house_households(households: pd.DataFrame, persons: pd.DataFrame, buildings: pd.DataFrame,
                      street: np.ndarray, house_no: np.ndarray, districts: pd.DataFrame,
                      rng: np.random.Generator) -> pd.DataFrame:
-    """Place every household into a residential building, then derive address fields."""
+    """Place every household into a residential building, then derive address fields.
+
+    Each residential building holds floor_area / sqm_per_dwelling homes (at least one), so a
+    detached house takes one household and a canal-side block takes several. If OSM has too
+    few homes mapped, every building's capacity is scaled up proportionally.
+    """
     H = len(households)
     size = persons.groupby("hh").size().reindex(range(H), fill_value=0).to_numpy()
     res = buildings[buildings.use_class.isin(["residential", "apartments"])]
-    houses = res[res.use_class == "residential"].index.to_numpy().copy()
-    flats = res[res.use_class == "apartments"]
-    flat_cap = np.maximum(2, (flats.footprint_m2 * flats.levels / 75).round().astype(int)).to_numpy()
-    flat_slots = np.repeat(flats.index.to_numpy(), flat_cap)
-    rng.shuffle(houses)
-    rng.shuffle(flat_slots)
-
-    # bigger families prefer houses; singles/sharers prefer flats
+    cap = np.maximum(1, np.round(res.footprint_m2 * res.levels / CITY.sqm_per_dwelling)).astype(int).to_numpy()
+    if cap.sum() < H * 1.05:
+        cap = np.ceil(cap * (H * 1.05 / cap.sum())).astype(int)
+    slot_building = np.repeat(res.index.to_numpy(), cap)
+    slot_cap = np.repeat(cap, cap)
+    chosen = rng.choice(len(slot_building), H, replace=False)
+    # bigger families get the slots in small buildings (houses); singles and sharers end up in blocks of flats
+    chosen = chosen[np.argsort(slot_cap[chosen] + rng.normal(0, 1.5, H), kind="stable")]
     pref = size + rng.normal(0, 1.2, H) + np.where(households["type"] == "shared", -1.5, 0)
     order = np.argsort(-pref)
-    n_house = min(len(houses), int(H * 0.72))
-    n_flat = H - n_house
-    if n_flat > len(flat_slots):  # not enough flats: houses split into maisonettes / HMOs
-        extra = rng.choice(houses, n_flat - len(flat_slots))
-        flat_slots = np.r_[flat_slots, extra]
-    slots = np.r_[houses[:n_house], flat_slots[:n_flat]]
     bidx = np.empty(H, dtype=np.int64)
-    bidx[order] = slots
+    bidx[order] = slot_building[chosen]
 
     b = buildings.loc[bidx]
     households["building_id"] = b["building_id"].to_numpy()
@@ -510,18 +575,19 @@ def house_households(households: pd.DataFrame, persons: pd.DataFrame, buildings:
     households["x"] = b["x"].to_numpy() + jitter[:, 0]
     households["y"] = b["y"].to_numpy() + jitter[:, 1]
 
-    pc_district = districts.set_index("district_id")["postcode_district"]
-    letters = np.array(list("ABDEFGHJLNPQRSTUWXYZ"))
     h1 = pd.util.hash_array(households["street"].astype(str).to_numpy().astype(object))
-    h2 = pd.util.hash_array((households["street"].astype(str) + (households["house_number"] // 24).astype(str)).to_numpy().astype(object))
-    households["postcode"] = (pc_district.loc[households["district_id"]].to_numpy() + " " +
-                              (h1 % 9 + 1).astype(str) + letters[h2 % 20] + letters[(h2 // 20) % 20])
+    h2 = pd.util.hash_array((households["street"].astype(str) + (households["house_number"] // 24).astype(str))
+                            .to_numpy().astype(object))
+    rank = households["district_id"].to_numpy().astype(int) - 1
+    households["postcode"] = CITY.postcode(rank, h1, h2, len(districts))
 
     centre = np.array([buildings.x.median(), buildings.y.median()])
-    dc = np.hypot(households["x"] - centre[0], households["y"] - centre[1])
-    car_p = np.clip(0.35 + dc / 12000, 0.35, 0.85)
+    dc_km = np.hypot(households["x"] - centre[0], households["y"] - centre[1]) / 1000
+    mc = CITY.modes
+    car_p = np.clip(mc.car_ownership_base + dc_km * mc.car_ownership_per_km, mc.car_ownership_base, mc.car_ownership_max)
     households["has_car"] = rng.random(H) < car_p
-    tenure_p = np.where(households["type"].isin(["shared", "single"]), 0.4, 0.62)
+    tenure_p = np.where(households["type"].isin(["shared", "single"]), 0.35, 0.55)
     u = rng.random(H)
-    households["tenure"] = np.where(u < tenure_p, "owner_occupied", np.where(u < tenure_p + 0.2, "private_rent", "social_rent"))
+    households["tenure"] = np.where(u < tenure_p, "owner_occupied",
+                                    np.where(u < tenure_p + 0.25, "private_rent", "social_rent"))
     return households

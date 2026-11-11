@@ -35,11 +35,13 @@ services:
     build: ./generator
     environment:
       DATABASE_URL: postgresql://city:city@db:5432/city
+      CITY: ${CITY:-amsterdam}
       POPULATION: ${POPULATION:-1000000}
       SEED: ${SEED:-42}
     volumes:
       - ./data:/data
       - ./db:/db:ro
+      - ./sql:/sql:ro
     depends_on:
       db:
         condition: service_healthy
@@ -49,8 +51,10 @@ services:
     environment:
       DATABASE_URL: postgresql://city:city@db:5432/city
       ANALYST_DATABASE_URL: postgresql://analyst:analyst@db:5432/city
+      SIM_DIR: /sim
     volumes:
       - ./sql:/sql:ro
+      - ./data/sim:/sim:ro
     ports:
       - "8000:8000"
     depends_on:
@@ -59,6 +63,8 @@ services:
 
   web:
     build: ./web
+    volumes:
+      - ./data/sim:/sim:ro
     ports:
       - "8080:80"
     depends_on:

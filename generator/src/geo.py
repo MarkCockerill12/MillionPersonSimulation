@@ -1,6 +1,6 @@
 """Turn raw OSM extracts into districts, buildings, places, roads and addresses.
 
-All metric work happens in EPSG:27700 (British National Grid, metres);
+All metric work happens in the city's projected CRS (metres, see cities.py);
 output geometries are WGS84 lon/lat.
 """
 
@@ -17,8 +17,15 @@ import pandas as pd
 import shapely
 from faker import Faker
 
-BNG = 27700
+BNG = 27700  # metric CRS in use; overwritten by configure()
 WGS = 4326
+DEFAULT_LEVELS = {"apartments": 4, "residential": 2, "commercial": 2, "industrial": 1, "education": 2, "healthcare": 3}
+
+
+def configure(metric_crs: int, default_levels: dict[str, int]) -> None:
+    global BNG, DEFAULT_LEVELS
+    BNG = metric_crs
+    DEFAULT_LEVELS = dict(default_levels)
 
 RESIDENTIAL = {"house", "detached", "semidetached_house", "terrace", "residential", "bungalow", "semi", "cottage"}
 APARTMENTS = {"apartments", "flats", "dormitory", "block"}
@@ -78,8 +85,7 @@ def build_districts(boundary_wgs: shapely.Geometry, suburbs: gpd.GeoDataFrame) -
 # --------------------------------------------------------------------- buildings
 def _levels(raw: pd.Series, use: pd.Series) -> np.ndarray:
     lv = pd.to_numeric(raw.str.extract(r"(\d+)")[0], errors="coerce")
-    default = use.map({"apartments": 4, "residential": 2, "commercial": 2, "industrial": 1,
-                       "education": 2, "healthcare": 3}).fillna(1)
+    default = use.map(DEFAULT_LEVELS).fillna(1)
     return lv.fillna(default).clip(1, 40).astype(np.int16).to_numpy()
 
 
@@ -236,12 +242,12 @@ def _district_lookup(x: np.ndarray, y: np.ndarray, districts_bng: gpd.GeoDataFra
     pts = gpd.GeoDataFrame(geometry=shapely.points(x, y), crs=BNG)
     j = gpd.sjoin(pts, districts_bng[["district_id", "geometry"]], predicate="within", how="left")
     j = j[~j.index.duplicated()]
-    d = j["district_id"].to_numpy()
-    missing = np.isnan(d.astype(float))
+    d = j["district_id"].to_numpy(dtype=float).copy()
+    missing = np.isnan(d)
     if missing.any():  # on a boundary edge: nearest district
         near = gpd.sjoin_nearest(pts[missing], districts_bng[["district_id", "geometry"]])
-        near = near[~near.index.duplicated()]
-        d[missing] = near["district_id"].to_numpy()
+        near = near[~near.index.duplicated()].reindex(pts.index[missing])
+        d[missing] = near["district_id"].to_numpy(dtype=float)
     return d.astype(np.int16)
 
 

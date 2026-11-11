@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import orjson
+import time
+
 from fastapi import APIRouter, HTTPException, Query
 
-from ..db import fetch_all, fetch_one
+from ..db import cursor, fetch_all, fetch_one
+from ..routing import get_router
 
 router = APIRouter(tags=["people"])
 
@@ -67,62 +69,47 @@ ORDER BY a.seq
 
 @router.get("/people/{person_id}")
 def person(person_id: int):
-    p = fetch_one(PERSON_SQL, {"id": person_id})
-    if not p:
-        raise HTTPException(404, "No such person")
-    args = {"id": person_id, "hh": p["household_id"]}
-    p["household"] = fetch_all(HOUSEHOLD_SQL, args)
-    p["relatives"] = fetch_all(RELATIVES_SQL, args)
-    p["schedule"] = fetch_all(SCHEDULE_SQL, args)
+    """Full record: one pooled connection, four indexed lookups."""
+    with cursor() as cur:
+        cur.execute(PERSON_SQL, {"id": person_id})
+        p = cur.fetchone()
+        if not p:
+            raise HTTPException(404, "No such person")
+        args = {"id": person_id, "hh": p["household_id"]}
+        for key, sql in (("household", HOUSEHOLD_SQL), ("relatives", RELATIVES_SQL), ("schedule", SCHEDULE_SQL)):
+            cur.execute(sql, args)
+            p[key] = cur.fetchall()
     return p
+
+
+STOPS_SQL = """
+SELECT a.seq, p.commute_mode, ST_X(COALESCE(pl.geom, h.geom)) AS lon, ST_Y(COALESCE(pl.geom, h.geom)) AS lat
+FROM activities a
+JOIN persons p    ON p.person_id = a.person_id
+JOIN households h ON h.household_id = p.household_id
+LEFT JOIN places pl ON pl.place_id = a.place_id
+WHERE a.person_id = %(id)s
+ORDER BY a.seq
+"""
 
 
 @router.get("/people/{person_id}/route")
 def person_route(person_id: int):
-    """GeoJSON FeatureCollection: one LineString per leg of the person's day."""
-    legs = fetch_all("""
-        SELECT a.seq, ST_X(g.geom) AS lon, ST_Y(g.geom) AS lat,
-               (SELECT node_id FROM road_nodes n ORDER BY n.geom <-> g.geom LIMIT 1) AS node
-        FROM activities a
-        JOIN persons p    ON p.person_id = a.person_id
-        JOIN households h ON h.household_id = p.household_id
-        LEFT JOIN places pl ON pl.place_id = a.place_id
-        CROSS JOIN LATERAL (SELECT COALESCE(pl.geom, h.geom) AS geom) g
-        WHERE a.person_id = %(id)s
-        ORDER BY a.seq
-    """, {"id": person_id})
-    if len(legs) < 2:
-        return {"type": "FeatureCollection", "features": []}
-    pairs = [(legs[i]["node"], legs[i + 1]["node"], legs[i]["seq"]) for i in range(len(legs) - 1)]
-    values = ",".join(f"({int(a)},{int(b)})" for a, b, _ in pairs if a != b)
-    if not values:
-        return {"type": "FeatureCollection", "features": []}
-    pad = 0.025  # ~2.5 km: route search is confined to the day's bounding box plus margin
-    x0, x1 = min(l["lon"] for l in legs) - pad, max(l["lon"] for l in legs) + pad
-    y0, y1 = min(l["lat"] for l in legs) - pad, max(l["lat"] for l in legs) + pad
-    rows = fetch_all(f"""
-        WITH r AS (
-            SELECT * FROM pgr_dijkstra(
-                $$SELECT edge_id AS id, source, target, cost_s AS cost, reverse_cost_s AS reverse_cost
-                  FROM city.road_edges
-                  WHERE geom && ST_MakeEnvelope({x0:.6f}, {y0:.6f}, {x1:.6f}, {y1:.6f}, 4326)$$,
-                $$SELECT * FROM (VALUES {values}) v(source, target)$$,
-                directed := true)
-        )
-        SELECT r.start_vid, r.end_vid,
-               ST_AsGeoJSON(ST_LineMerge(ST_Collect(e.geom ORDER BY r.path_seq)), 6) AS geom,
-               round(sum(e.length_m)) AS length_m, round(max(r.agg_cost) / 60) AS drive_min
-        FROM r JOIN road_edges e ON e.edge_id = r.edge
-        GROUP BY r.start_vid, r.end_vid
-    """)
-    by_pair = {(r["start_vid"], r["end_vid"]): r for r in rows}
+    """GeoJSON FeatureCollection: one LineString per leg of the person's day (in-memory Dijkstra)."""
+    t = time.perf_counter()
+    stops = fetch_all(STOPS_SQL, {"id": person_id})
+    r = get_router()
+    profile = "active" if stops and stops[0]["commute_mode"] in ("walk", "cycle") else "car"
+    nodes = [r.nearest(s["lon"], s["lat"]) for s in stops]
     features = []
-    for a, b, seq in pairs:
-        r = by_pair.get((a, b))
-        if r:
-            features.append({"type": "Feature", "geometry": orjson.loads(r["geom"]),
-                             "properties": {"leg": seq, "length_m": r["length_m"], "drive_min": r["drive_min"]}})
-    return {"type": "FeatureCollection", "features": features}
+    for i in range(len(stops) - 1):
+        leg = r.route(nodes[i], nodes[i + 1], profile)
+        if leg:
+            coords, metres, _ = leg
+            features.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords},
+                             "properties": {"leg": stops[i]["seq"], "length_m": round(metres), "profile": profile}})
+    return {"type": "FeatureCollection", "features": features,
+            "routing_ms": round((time.perf_counter() - t) * 1000, 1)}
 
 
 @router.get("/search")
