@@ -1,12 +1,10 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import DeckGL, { type DeckGLRef } from '@deck.gl/react'
+import { MapboxOverlay, type MapboxOverlayProps } from '@deck.gl/mapbox'
 import { GeoJsonLayer, ScatterplotLayer } from '@deck.gl/layers'
-import { WebMercatorViewport, type MapViewState, type PickingInfo } from '@deck.gl/core'
-import { Map } from 'react-map-gl/maplibre'
+import type { PickingInfo } from '@deck.gl/core'
+import { Map, useControl, type MapLayerMouseEvent, type MapRef } from 'react-map-gl/maplibre'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { setWorkerUrl } from 'maplibre-gl'
-// MapLibre 6 ships its tile worker as a separate ES module; let Vite bundle it and tell MapLibre where it is.
-import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
+import type { StyleSpecification } from 'maplibre-gl'
 import { api, type Meta, type Person } from '../api'
 import { alongLine, decodeChunk, legAt, positionOf, type Chunk, type Manifest } from '../sim'
 import { SimLayer, type ColourMode } from '../layers/SimLayer'
@@ -15,11 +13,25 @@ import { TimeBar } from '../components/TimeBar'
 import { Search } from '../components/Search'
 import { PerfReadout } from '../components/PerfReadout'
 
-setWorkerUrl(maplibreWorkerUrl)
 
-const DEBUG = new URLSearchParams(window.location.search).has('debug')
+const QS = new URLSearchParams(window.location.search)
+const DEBUG = QS.has('debug')
+// performance experiments (debug only): ?debug=1 plus &nobasemap=1 / &nopeople=1 / &nolod=1 / &fullstyle=1
+const NO_BASEMAP = DEBUG && QS.has('nobasemap')
+const NO_PEOPLE = DEBUG && QS.has('nopeople')
+const NO_LOD = DEBUG && QS.has('nolod')
 
 const BASEMAP = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
+// CARTO Dark Matter, trimmed. The full style draws 95 layers per tile (16 tunnel layers, casings for every road
+// class, buildings, house numbers…); behind a million dots most of that is invisible but every layer is a draw
+// call per tile per frame. Keeping ~30 halves the basemap's cost while panning. ?debug=1&fullstyle=1 compares.
+const KEEP_LAYER = /^(background|landcover|park_|landuse|water$|waterway$|road_(minor|sec|pri|trunk|mot)_fill|bridge_(minor|sec|pri|trunk|mot)_fill|rail$|waterway_label|watername_lake|place_(hamlet|suburbs|villages|town|city)|roadname_(sec|pri|major))/
+async function loadBasemapStyle(full: boolean): Promise<StyleSpecification> {
+  const style: StyleSpecification = await fetch(BASEMAP).then((r) => r.json())
+  if (!full) style.layers = style.layers.filter((l: { id: string }) => KEEP_LAYER.test(l.id))
+  return style
+}
+const EMPTY_STYLE = { version: 8 as const, sources: {}, layers: [{ id: 'bg', type: 'background' as const, paint: { 'background-color': '#0e1a22' } }] }
 
 export type ColourBy = 'activity' | 'signature' | 'mode' | 'age'
 const COLOUR_MODE: Record<ColourBy, ColourMode> = { activity: 0, signature: 1, mode: 2, age: 3 }
@@ -43,6 +55,20 @@ const legends = (modeLabels: Record<string, string>): Record<ColourBy, { label: 
   ],
 })
 
+// deck.gl drawn *inside* MapLibre's WebGL context (interleaved): one context, one canvas, one render loop,
+// and MapLibre owns the camera, so dragging never touches React. Automatic picking is off (pickAsync: false):
+// deck would otherwise re-render every resident into a picking buffer and read it back on every mouse move.
+// We pick explicitly on click, and on hover only once the mouse has paused.
+function DeckOverlay(props: MapboxOverlayProps & { onReady: (o: MapboxOverlay) => void }) {
+  const { onReady, ...rest } = props
+  const overlay = useControl<MapboxOverlay>(() => new MapboxOverlay({ ...rest, interleaved: true, pickAsync: false } as never))
+  overlay.setProps({ ...rest, pickAsync: false } as never)
+  useEffect(() => onReady(overlay), [overlay, onReady])
+  return null
+}
+
+const FIT_PADDING = () => (window.innerWidth > 1100 ? { left: 380, right: 450, top: 80, bottom: 130 } : 40)
+
 export interface LoadStats { people: number; bytes: number; ms: number | null; chunks: number; total: number }
 
 const MemoPanel = memo(PersonPanel)
@@ -64,8 +90,12 @@ export default function MapPage() {
   const [person, setPerson] = useState<Person | null>(null)
   const [route, setRoute] = useState<GeoJSON.FeatureCollection | null>(null)
   const [routeMs, setRouteMs] = useState<number | null>(null)
-  const [viewState, setViewState] = useState<MapViewState | null>(null)
-  const deckRef = useRef<DeckGLRef>(null)
+  const [initialView, setInitialView] = useState<{ longitude: number; latitude: number; zoom: number } | null>(null)
+  const mapRef = useRef<MapRef>(null)
+  const overlayRef = useRef<MapboxOverlay | null>(null)
+  const hoverTimer = useRef<number | undefined>(undefined)
+  const movingRef = useRef(false)  // camera in motion (drag, zoom, fly-to)
+  const pendingFit = useRef<[[number, number], [number, number]] | null>(null)
 
   // ---- city metadata + snapshot chunks, fetched in parallel; each chunk renders the moment it lands
   useEffect(() => {
@@ -75,7 +105,7 @@ export default function MapPage() {
       if (cancelled) return
       setMeta(m)
       const [x0, y0, x1, y1] = m.bbox
-      setViewState((v) => v ?? { longitude: (x0 + x1) / 2, latitude: (y0 + y1) / 2, zoom: 11, pitch: 0, bearing: 0 })
+      setInitialView((v) => v ?? { longitude: (x0 + x1) / 2, latitude: (y0 + y1) / 2, zoom: 11 })
     }).catch((e) => !cancelled && setError(e.message))
     ;(async () => {
       try {
@@ -85,7 +115,7 @@ export default function MapPage() {
         if (cancelled) return
         setManifest(man)
         // the snapshot alone is enough to show the map, even if /api/meta is slow or down
-        setViewState((v) => v ?? { longitude: (man.bbox[0] + man.bbox[2]) / 2, latitude: (man.bbox[1] + man.bbox[3]) / 2, zoom: 11, pitch: 0, bearing: 0 })
+        setInitialView((v) => v ?? { longitude: (man.bbox[0] + man.bbox[2]) / 2, latitude: (man.bbox[1] + man.bbox[3]) / 2, zoom: 11 })
         setLoad((l) => ({ ...l, total: man.chunks.length }))
         await Promise.all(man.chunks.map(async (c) => {
           const res = await fetch(c.url)
@@ -128,10 +158,11 @@ export default function MapPage() {
       if (!fly) return
       const xs = p.schedule.map((s) => s.lon), ys = p.schedule.map((s) => s.lat)
       const pad = 0.002
-      const vp = new WebMercatorViewport({ width: window.innerWidth, height: window.innerHeight })
-      const fit = vp.fitBounds([[Math.min(...xs) - pad, Math.min(...ys) - pad], [Math.max(...xs) + pad, Math.max(...ys) + pad]],
-        { padding: window.innerWidth > 1100 ? { left: 380, right: 450, top: 80, bottom: 130 } : 40 })
-      setViewState((v) => ({ ...(v ?? fit), longitude: fit.longitude, latitude: fit.latitude, zoom: Math.min(fit.zoom, 16), transitionDuration: 900 }))
+      // frame the whole day (home, work, errands) between the side panels; MapLibre animates natively
+      const bounds: [[number, number], [number, number]] = [[Math.min(...xs) - pad, Math.min(...ys) - pad], [Math.max(...xs) + pad, Math.max(...ys) + pad]]
+      // a deep-linked record can arrive before the map exists: park the camera move until it loads
+      if (mapRef.current) mapRef.current.fitBounds(bounds, { padding: FIT_PADDING(), maxZoom: 16, duration: 900 })
+      else pendingFit.current = bounds
     }).catch((e) => setError(e.message))
     const t = performance.now()
     api.route(id).then((r) => { setRoute(r); setRouteMs(performance.now() - t) }).catch(() => setRoute(null))
@@ -154,10 +185,71 @@ export default function MapPage() {
     window.history.replaceState(null, '', url)
   }, [selected])
 
-  const onClick = useCallback((info: PickingInfo) => {
-    const ch = (info.layer?.props as { chunkStart?: number } | undefined)?.chunkStart
-    if (ch != null && info.index >= 0) select(ch + info.index + 1)
-  }, [select])
+  const pickAt = useCallback((x: number, y: number): PickingInfo | null =>
+    overlayRef.current?.pickObject({ x, y, radius: 6 }) ?? null, [])
+
+  const onMapClick = useCallback((e: MapLayerMouseEvent) => {
+    const info = pickAt(e.point.x, e.point.y)
+    const ch = (info?.layer?.props as { chunkStart?: number } | undefined)?.chunkStart
+    if (info && ch != null && info.index >= 0) select(ch + info.index + 1)
+  }, [pickAt, select])
+
+  // hover affordance without per-frame picking: pick once the pointer has rested for 120 ms, and never while
+  // a button is held or the camera is moving (each pick is a synchronous GPU read-back)
+  const onMapMouseMove = useCallback((e: MapLayerMouseEvent) => {
+    window.clearTimeout(hoverTimer.current)
+    if (e.originalEvent.buttons !== 0 || movingRef.current) return
+    const canvas = e.target.getCanvas()
+    if (canvas.style.cursor === 'pointer') canvas.style.cursor = ''
+    hoverTimer.current = window.setTimeout(() => {
+      const info = pickAt(e.point.x, e.point.y)
+      canvas.style.cursor = info?.layer?.props && (info.layer.props as { chunkStart?: number }).chunkStart != null ? 'pointer' : ''
+    }, 120)
+  }, [pickAt])
+
+  // Level of detail while the camera moves: zoomed out, a million dots overlap heavily (most pixels are painted
+  // many times), so drawing a uniform 50% sample during a drag looks the same and halves the overdraw.
+  // Everyone is drawn again the moment the camera stops. Zoomed in, all residents are always drawn.
+  const [motionLod, setMotionLod] = useState(false)
+  const onMoveStart = useCallback((e: { target: { getZoom: () => number } }) => {
+    movingRef.current = true
+    window.clearTimeout(hoverTimer.current)
+    if (!NO_LOD && e.target.getZoom() < 13) setMotionLod(true)
+  }, [])
+  const onMoveEnd = useCallback(() => { movingRef.current = false; setMotionLod(false) }, [])
+
+  const [basemapStyle, setBasemapStyle] = useState<StyleSpecification | null>(null)
+  useEffect(() => {
+    loadBasemapStyle(DEBUG && QS.has('fullstyle')).then(setBasemapStyle).catch(() => setBasemapStyle(null))
+  }, [])
+
+  // draw residents beneath the basemap's place labels so names stay readable
+  const [labelLayer, setLabelLayer] = useState<string | undefined>(undefined)
+  const onMapLoad = useCallback(() => {
+    if (pendingFit.current) {
+      mapRef.current?.fitBounds(pendingFit.current, { padding: FIT_PADDING(), maxZoom: 16, duration: 900 })
+      pendingFit.current = null
+    }
+  }, [])
+  const onStyleLoad = useCallback(() => {
+    const layers = mapRef.current?.getMap().getStyle().layers ?? []
+    setLabelLayer(layers.find((l) => l.type === 'symbol')?.id)
+  }, [])
+
+  // Warm up deck's picking framebuffer while the browser is idle, so the first click or hover doesn't pay for
+  // allocating it (and luma.gl's format-capability probe, which uses synchronous gl.getError calls).
+  const chunkCount = chunks.length
+  useEffect(() => {
+    if (!chunkCount || !overlayRef.current) return
+    const idle = window.requestIdleCallback ?? ((cb: () => void) => window.setTimeout(cb, 200))
+    const h = idle(() => { overlayRef.current?.pickObject({ x: 1, y: 1, radius: 0 }) })
+    return () => (window.cancelIdleCallback ?? window.clearTimeout)(h)
+  }, [chunkCount])
+
+  const onOverlayReady = useCallback((o: MapboxOverlay) => {
+    overlayRef.current = o
+    if (import.meta.env.DEV || DEBUG) Object.assign(window, { __overlay: o, __map: mapRef.current?.getMap() })
+  }, [])
 
   // ---- layers: one GPU sim layer per chunk; only `time` / `colourMode` change per frame
   const bbox = manifest?.bbox
@@ -174,9 +266,11 @@ export default function MapPage() {
     radiusMinPixels: 0.7,
     radiusMaxPixels: 6,
     pickable: copy === 0,
+    beforeId: labelLayer,
+    drawFraction: motionLod ? 0.5 : 1,
     // opaque dots: no depth test and no blending, so overlapping people cost a plain write instead of a read-modify-write
     parameters: { depthWriteEnabled: false, depthCompare: 'always', blend: false },
-  } as never))).flat(), [chunks, bbox, minute, colourBy, scale])
+  } as never))).flat(), [chunks, bbox, minute, colourBy, scale, labelLayer, motionLod])
 
   const overlay = useMemo(() => {
     const out: unknown[] = []
@@ -221,21 +315,25 @@ export default function MapPage() {
 
   return (
     <div className="map-page">
-      {viewState && (
-        <DeckGL
-          viewState={viewState}
-          onViewStateChange={({ viewState: v }) => setViewState(v as MapViewState)}
-          controller
-          layers={[...peopleLayers, ...overlay] as never}
-          onClick={onClick}
-          pickingRadius={6}
-          // exposes deck.gl (frame metrics, picking) to the automated UI checks in scripts/; dev or ?debug=1 only
-          ref={deckRef}
-          onLoad={() => { if (import.meta.env.DEV || DEBUG) Object.assign(window, { __deckRef: deckRef }) }}
-          getCursor={({ isHovering }) => (isHovering ? 'pointer' : 'grab')}
+      {initialView && (
+        <Map
+          ref={mapRef}
+          initialViewState={initialView}
+          mapStyle={NO_BASEMAP ? EMPTY_STYLE : basemapStyle ?? EMPTY_STYLE}
+          onClick={onMapClick}
+          onMouseMove={onMapMouseMove}
+          onLoad={onMapLoad}
+          onStyleData={onStyleLoad}
+          onMoveStart={onMoveStart}
+          onMoveEnd={onMoveEnd}
+          dragRotate={false}
+          renderWorldCopies={false}
+          pitchWithRotate={false}
+          touchPitch={false}
+          style={{ position: 'absolute', inset: 0 }}
         >
-          <Map mapStyle={BASEMAP} />
-        </DeckGL>
+          <DeckOverlay layers={[...(NO_PEOPLE ? [] : peopleLayers), ...overlay] as never} onReady={onOverlayReady} />
+        </Map>
       )}
 
       <aside className="rail">

@@ -15,7 +15,7 @@ The city is real: about 138k building footprints, 25k shops, schools, offices an
 | **Database** | PostgreSQL 17 + PostGIS 3.5 + pgRouting 3.8 (Docker) |
 | **Data pipeline** | Python: pyosmium, GeoPandas, NumPy/SciPy, Faker, bulk `COPY` |
 | **API** | FastAPI with hand-written SQL (psycopg 3, no ORM), in-memory SciPy routing |
-| **Frontend** | React + TypeScript, deck.gl with a custom WebGL layer, MapLibre, Recharts |
+| **Frontend** | React + TypeScript, deck.gl (custom two-pass WebGL2 layer, interleaved in MapLibre), Recharts |
 
 ## What's in it
 
@@ -29,7 +29,8 @@ The rule of thumb: **nothing a visitor does should touch more data than it shows
 
 | What | How | Measured (1M people) |
 |---|---|---|
-| Animating the whole city | Each person's day sits in static GPU buffers. A custom deck.gl layer's vertex shader works out every position and colour from a single `time` uniform, so a frame costs one uniform write with no CPU loop and no buffer upload. Points are opaque sprites with blending off. | **45–60 fps** at 1M, **45–60 fps** at 5M, **20–60 fps** at 10M agents (`?scale=N` benchmark), measured in Chrome on an integrated AMD Radeon laptop GPU |
+| Animating the whole city | Two GPU passes. A **simulation pass** (WebGL2 transform feedback) reads each person's day from static buffers and writes their current position and packed colour into GPU buffers. It runs only when the clock or colour mode changes. A **draw pass** is a trivial shader that projects those positions as tiny instanced quads. No CPU loop, no per-frame uploads. | Locked **60 fps** at 1M while playing |
+| Dragging and zooming | deck.gl renders *inside* MapLibre's WebGL context (interleaved): one context, one canvas, one render loop. MapLibre owns the camera, so a drag never touches React. A camera move re-runs only the draw pass, never the simulation. Automatic picking is off: clicks pick once, and hover picks only after the pointer rests, never mid-drag. The picking buffer is warmed while idle. A 39-layer trimmed basemap replaces the full 95-layer style. Zoomed out, motion LOD draws a uniform 50% sample while the camera moves. | Locked **60 fps** dragging 1M at 150% display scaling (worst frame 17 ms, was ~31 fps before); 59 fps at 3M, 43 fps at 5M (`?scale=N`), on an integrated AMD Radeon laptop GPU |
 | Loading the city | The generator writes the snapshot as 8 quantised, columnar chunks (32 bytes per person, unorm16 coordinates and times). It's pre-gzipped and served by nginx as immutable static files. Chunks download in parallel and each renders as soon as it lands. Typed arrays are views straight into the downloaded buffer and go to the GPU as-is. | 19.4 MB total, **0.3–0.8 s** cold, **0.2 s** cached |
 | Opening a record | 4 indexed lookups on one pooled connection | **15–40 ms** |
 | Road route | Road graph loaded once into SciPy sparse matrices: fastest route for drivers, shortest motorway-free route for walkers and cyclists. Dijkstra runs in C. | **7–17 ms** (was 260 ms with per-request `pgr_dijkstra`) |
@@ -38,6 +39,8 @@ The rule of thumb: **nothing a visitor does should touch more data than it shows
 | Generating the city | Vectorised NumPy, buffered RNG in the household loop (was 289 s, now 35 s), `COPY` bulk load, indexes built after load with parallel workers | **~2 min** natively, **~7 min** inside Docker Desktop, for 1M people end to end |
 
 The frame rate and load time are shown live in the map's side panel.
+
+**How it was measured**: [`bench/`](bench) contains the benchmarks used to find each bottleneck. They drive headless Chrome on the real GPU over the DevTools protocol: camera pans (`panbench`), real mouse drags (`dragbench`), a raw WebGL throughput ceiling (`glbench`) and main-thread profiles with call chains (`cpuprof`). Debug switches (`?debug=1&nobasemap=1`, `&nopeople=1`, `&nolod=1`, `&fullstyle=1`) isolate each component's cost.
 
 ## Data model
 
